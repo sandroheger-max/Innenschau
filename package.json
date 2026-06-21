@@ -1,0 +1,20 @@
+{
+  "name": "innenschau-pwa",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Innenschau – tägliche Standortbestimmung. Standalone PWA build.",
+  "scripts": {
+    "build": "esbuild main.jsx --bundle --minify --format=esm --jsx=automatic --outfile=bundle.js --loader:.js=jsx",
+    "watch": "esbuild main.jsx --bundle --format=esm --jsx=automatic --outfile=bundle.js --loader:.js=jsx --watch",
+    "serve": "npx serve ."
+  },
+  "dependencies": {
+    "lucide-react": "0.383.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "recharts": "^2.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.20.0"
+  }
+}
