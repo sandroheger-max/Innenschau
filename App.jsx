@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Plus, Trash2, Play, Pause, Sparkles, Download, Loader2, Mic, ChevronLeft, ChevronRight, Search, X } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { addDays, computeLongest, computeStrength, mergeMorning, mergeEvening, storage } from "./logic.js";
 
 const C = {
   paper: "#FCF7EF",
@@ -87,51 +88,31 @@ const MEDITATION_STEPS = [
   "Wenn du bereit bist, öffne langsam die Augen.",
 ];
 
+function parseProToken(token) {
+  try {
+    const b64 = token.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const { payload } = JSON.parse(atob(padded));
+    return JSON.parse(payload);
+  } catch { return null; }
+}
+function isProTokenValid(token) {
+  if (!token) return false;
+  const p = parseProToken(token);
+  return !!(p && p.exp > Date.now());
+}
+
 const SpeechRecognitionAPI = typeof window !== "undefined" ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
 
-// Standalone-app storage: mirrors the window.storage API (get/set) from the
-// Claude artifact preview, but persists to the browser's localStorage so the
-// app works as a normal installable PWA outside Claude.ai.
-const storage = {
-  async get(key) {
-    try {
-      const value = localStorage.getItem(`innenschau:${key}`);
-      return value !== null ? { key, value } : null;
-    } catch (err) { return null; }
-  },
-  async set(key, value) {
-    try {
-      localStorage.setItem(`innenschau:${key}`, value);
-      return { key, value };
-    } catch (err) { return null; }
-  },
-};
 
 function pad(n) { return String(n).padStart(2, "0"); }
 function todayKey() { return new Date().toISOString().slice(0, 10); }
 function fmt(key) { const [y, m, d] = key.split("-"); return `${d}.${m}.${y}`; }
 function fmtShort(key) { const [, m, d] = key.split("-"); return `${d}.${m}.`; }
-function addDays(dateStr, days) { const d = new Date(dateStr); d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10); }
 function dayOfYear(d) { const start = new Date(d.getFullYear(), 0, 0); return Math.floor((d - start) / 86400000); }
 function todaysPrompt() { return REFLECTION_PROMPTS[dayOfYear(new Date()) % REFLECTION_PROMPTS.length]; }
 function todaysQuestion() { return STILL_QUESTIONS[dayOfYear(new Date()) % STILL_QUESTIONS.length]; }
 function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + "…" : s; }
-function computeLongest(sortedKeys) {
-  if (!sortedKeys.length) return 1;
-  let longest = 1, run = 1;
-  for (let i = 1; i < sortedKeys.length; i++) {
-    const diff = (new Date(sortedKeys[i]) - new Date(sortedKeys[i - 1])) / 86400000;
-    run = diff === 1 ? run + 1 : 1;
-    if (run > longest) longest = run;
-  }
-  return longest;
-}
-function computeStrength(sortedKeys, days = 14) {
-  if (!sortedKeys.length) return 0;
-  const cutoff = addDays(todayKey(), -(days - 1));
-  const count = sortedKeys.filter((k) => k >= cutoff && k <= todayKey()).length;
-  return Math.round((count / days) * 100);
-}
 
 function MicButton({ active, onClick, color }) {
   if (!SpeechRecognitionAPI) return null;
@@ -183,6 +164,12 @@ export default function App() {
   const [aiError, setAiError] = useState("");
   const [aiRange, setAiRange] = useState(14);
 
+  const [proToken, setProToken] = useState(null);
+  const [proEmail, setProEmail] = useState("");
+  const [proEmailInput, setProEmailInput] = useState("");
+  const [proStatus, setProStatus] = useState("idle"); // idle | checking | active | inactive | error
+  const [pendingProEmail, setPendingProEmail] = useState(null);
+
   const [searchQuery, setSearchQuery] = useState("");
   const [filterTag, setFilterTag] = useState(null);
 
@@ -209,6 +196,27 @@ export default function App() {
           setAffirmation(t.morning.affirmation ?? "");
         }
       }
+      // Load PRO subscription token from localStorage
+      const savedToken = localStorage.getItem("innenschau:proToken");
+      const savedEmail = localStorage.getItem("innenschau:proEmail");
+      if (savedEmail) setProEmailInput(savedEmail);
+      if (savedToken && isProTokenValid(savedToken)) {
+        setProToken(savedToken);
+        setProEmail(savedEmail || "");
+        setProStatus("active");
+      } else if (savedEmail) {
+        setProStatus("inactive");
+      }
+
+      // Handle redirect back from Stripe Checkout
+      const urlParams = new URLSearchParams(window.location.search);
+      const proParam = urlParams.get("pro");
+      const emailParam = urlParams.get("email");
+      if (proParam) window.history.replaceState({}, "", "/");
+      if (proParam === "success" && emailParam) {
+        setPendingProEmail(decodeURIComponent(emailParam));
+      }
+
       setLoading(false);
     })();
     return () => recognitionRef.current?.stop();
@@ -222,6 +230,40 @@ export default function App() {
     setGoals(next);
     try { await storage.set("goals", JSON.stringify(next)); } catch (err) { console.error(err); }
   }, []);
+
+  const checkSubscription = useCallback(async (email) => {
+    const trimmed = email.trim().toLowerCase();
+    setProStatus("checking");
+    try {
+      const res = await fetch("/api/check-subscription", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: trimmed }),
+      });
+      const data = await res.json();
+      if (data.hasSubscription && data.token) {
+        setProToken(data.token);
+        setProEmail(trimmed);
+        setProStatus("active");
+        localStorage.setItem("innenschau:proToken", data.token);
+        localStorage.setItem("innenschau:proEmail", trimmed);
+      } else if (data.checkoutUrl) {
+        setProStatus("inactive");
+        window.location.href = data.checkoutUrl;
+      } else {
+        setProStatus("inactive");
+      }
+    } catch {
+      setProStatus("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (pendingProEmail) {
+      checkSubscription(pendingProEmail);
+      setPendingProEmail(null);
+    }
+  }, [pendingProEmail, checkSubscription]);
 
   function toggleTag(t) { setTags((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t])); }
   function stopMic() { recognitionRef.current?.stop(); setActiveMic(null); }
@@ -249,18 +291,14 @@ export default function App() {
 
   function handleSaveMorning() {
     stopMic();
-    const existing = entries[todayKey()] || {};
-    const next = { ...entries, [todayKey()]: { ...existing, morning: { intention, gratitudeFor, affirmation, ts: Date.now() } } };
-    saveEntries(next);
+    saveEntries(mergeMorning(entries, todayKey(), { intention, gratitudeFor, affirmation }));
     setSavedMorning(true);
     setTimeout(() => setSavedMorning(false), 1800);
   }
 
   function handleSaveEntry() {
     stopMic();
-    const existing = entries[todayKey()] || {};
-    const next = { ...entries, [todayKey()]: { ...existing, mood, woStehe, reflectionAnswer, reflectionPrompt: promptText, dankbarkeit, tags, goalId: linkedGoalId, ts: Date.now() } };
-    saveEntries(next);
+    saveEntries(mergeEvening(entries, todayKey(), { mood, woStehe, reflectionAnswer, reflectionPrompt: promptText, dankbarkeit, tags, goalId: linkedGoalId }));
     setSaved(true);
     setTimeout(() => setSaved(false), 1800);
   }
@@ -322,13 +360,25 @@ export default function App() {
       // api/analyze.js, which holds the real Anthropic call server-side.
       const response = await fetch("/api/analyze", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, proToken }),
       });
+      if (response.status === 402) {
+        setProToken(null);
+        setProStatus("inactive");
+        localStorage.removeItem("innenschau:proToken");
+        throw new Error("subscription_expired");
+      }
       if (!response.ok) throw new Error("backend not reachable");
       const data = await response.json();
       const text = (data.text || "").trim();
       setAiResult(text || "Konnte keine Analyse erzeugen. Versuch es nochmal.");
-    } catch (err) { setAiError("Analyse fehlgeschlagen. Prüf deine Verbindung und versuch es nochmal."); }
+    } catch (err) {
+      setAiError(
+        err.message === "subscription_expired"
+          ? "Abo-Token abgelaufen. Bitte prüfe dein Abo erneut (E-Mail oben eingeben)."
+          : "Analyse fehlgeschlagen. Prüf deine Verbindung und versuch es nochmal."
+      );
+    }
     finally { setAiLoading(false); }
   }
 
@@ -590,25 +640,58 @@ export default function App() {
 
             {sortedKeys.length > 0 && (
               <Card tint={C.goldSoft} className="!border-0">
-                <div className="flex items-center justify-between mb-2">
-                  <p style={{ fontFamily: MONO, fontSize: 11, color: C.gold }} className="flex items-center gap-1.5">
-                    KI-ANALYSE
-                    <span style={{ backgroundColor: C.gold, color: "white", fontSize: 9, padding: "1px 7px", borderRadius: 999 }}>PRO</span>
-                  </p>
-                  <div className="flex rounded-full overflow-hidden" style={{ border: `1px solid ${C.gold}` }}>
-                    <button onClick={() => setAiRange(14)} style={{ fontFamily: MONO, fontSize: 10, padding: "3px 9px", backgroundColor: aiRange === 14 ? C.gold : "white", color: aiRange === 14 ? "white" : C.gold }}>14 TAGE</button>
-                    <button onClick={() => setAiRange(30)} style={{ fontFamily: MONO, fontSize: 10, padding: "3px 9px", backgroundColor: aiRange === 30 ? C.gold : "white", color: aiRange === 30 ? "white" : C.gold }}>30 TAGE</button>
+                <p style={{ fontFamily: MONO, fontSize: 11, color: C.gold }} className="flex items-center gap-1.5 mb-3">
+                  KI-ANALYSE
+                  <span style={{ backgroundColor: C.gold, color: "white", fontSize: 9, padding: "1px 7px", borderRadius: 999 }}>PRO</span>
+                </p>
+                {proStatus !== "active" ? (
+                  <div>
+                    <p style={{ fontSize: 13, color: C.inkSoft, lineHeight: 1.6 }} className="mb-3">
+                      Claude erkennt Muster in deinen Einträgen — Zusammenhänge zwischen Stimmung, Aktivitäten und Fortschritt.
+                    </p>
+                    <p style={{ fontFamily: MONO, fontSize: 11, color: C.gold }} className="mb-4">CHF 4.90 / MONAT · JEDERZEIT KÜNDBAR</p>
+                    {proStatus === "checking" ? (
+                      <div className="flex items-center gap-2" style={{ color: C.inkSoft, fontSize: 13 }}>
+                        <Loader2 size={14} className="animate-spin" /> Wird überprüft…
+                      </div>
+                    ) : (
+                      <>
+                        <input value={proEmailInput} onChange={(e) => setProEmailInput(e.target.value)}
+                          onKeyDown={(e) => e.key === "Enter" && proEmailInput.trim() && checkSubscription(proEmailInput)}
+                          placeholder="Deine E-Mail-Adresse" type="email"
+                          className="w-full p-3 text-sm bg-white rounded-xl border mb-2" style={{ borderColor: C.line }} />
+                        <button onClick={() => proEmailInput.trim() && checkSubscription(proEmailInput)}
+                          disabled={!proEmailInput.trim()}
+                          style={{ background: G.gold, color: "white", fontSize: 13, boxShadow: "0 6px 14px -6px rgba(224,165,46,0.55)", opacity: proEmailInput.trim() ? 1 : 0.5 }}
+                          className="w-full py-3 rounded-full flex items-center justify-center gap-2">
+                          <Sparkles size={14} />
+                          {proStatus === "inactive" && proEmail ? "Erneut prüfen" : "Pro freischalten"}
+                        </button>
+                        {proStatus === "error" && <p style={{ fontSize: 12, color: C.coral }} className="mt-2">Verbindung fehlgeschlagen — bitte nochmal versuchen.</p>}
+                        {proStatus === "inactive" && proEmail && <p style={{ fontSize: 12, color: C.inkSoft }} className="mt-2">Kein aktives Abo für {proEmail} gefunden.</p>}
+                      </>
+                    )}
                   </div>
-                </div>
-                <button onClick={runAIAnalysis} disabled={aiLoading}
-                  style={{ background: G.gold, color: "white", fontSize: 12, boxShadow: "0 6px 14px -6px rgba(224,165,46,0.55)" }}
-                  className="px-3 py-1.5 rounded-full flex items-center gap-1.5 mb-3">
-                  {aiLoading ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
-                  {aiLoading ? "Denkt nach…" : "Muster zeigen"}
-                </button>
-                {aiError && <p style={{ color: C.inkSoft, fontSize: 12 }}>{aiError}</p>}
-                {aiResult && <p style={{ fontSize: 13, lineHeight: 1.6 }}>{aiResult}</p>}
-                {!aiResult && !aiError && !aiLoading && <p style={{ color: C.inkSoft, fontSize: 12 }}>Lässt Claude Muster in deinen Einträgen finden.</p>}
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between mb-3">
+                      <span style={{ fontFamily: MONO, fontSize: 10, color: C.sage }}>✓ AKTIV · {proEmail}</span>
+                      <div className="flex rounded-full overflow-hidden" style={{ border: `1px solid ${C.gold}` }}>
+                        <button onClick={() => setAiRange(14)} style={{ fontFamily: MONO, fontSize: 10, padding: "3px 9px", backgroundColor: aiRange === 14 ? C.gold : "white", color: aiRange === 14 ? "white" : C.gold }}>14 TAGE</button>
+                        <button onClick={() => setAiRange(30)} style={{ fontFamily: MONO, fontSize: 10, padding: "3px 9px", backgroundColor: aiRange === 30 ? C.gold : "white", color: aiRange === 30 ? "white" : C.gold }}>30 TAGE</button>
+                      </div>
+                    </div>
+                    <button onClick={runAIAnalysis} disabled={aiLoading}
+                      style={{ background: G.gold, color: "white", fontSize: 12, boxShadow: "0 6px 14px -6px rgba(224,165,46,0.55)" }}
+                      className="px-3 py-1.5 rounded-full flex items-center gap-1.5 mb-3">
+                      {aiLoading ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+                      {aiLoading ? "Denkt nach…" : "Muster zeigen"}
+                    </button>
+                    {aiError && <p style={{ color: C.inkSoft, fontSize: 12 }}>{aiError}</p>}
+                    {aiResult && <p style={{ fontSize: 13, lineHeight: 1.6 }}>{aiResult}</p>}
+                    {!aiResult && !aiError && !aiLoading && <p style={{ color: C.inkSoft, fontSize: 12 }}>Lässt Claude Muster in deinen Einträgen finden.</p>}
+                  </>
+                )}
               </Card>
             )}
 
@@ -816,33 +899,64 @@ function RuheTab() {
   );
 }
 
+function speak(text) {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const utter = new SpeechSynthesisUtterance(text);
+  utter.lang = "de-DE";
+  utter.rate = 0.78;
+  utter.pitch = 0.9;
+  const trySpeak = () => {
+    const voices = window.speechSynthesis.getVoices();
+    const deVoice = voices.find((v) => v.lang.startsWith("de"));
+    if (deVoice) utter.voice = deVoice;
+    window.speechSynthesis.speak(utter);
+  };
+  // voices may load asynchronously (Firefox)
+  if (window.speechSynthesis.getVoices().length === 0) {
+    window.speechSynthesis.onvoiceschanged = trySpeak;
+  } else {
+    trySpeak();
+  }
+}
+
 function GefuehrteMeditation() {
   const [running, setRunning] = useState(false);
   const [step, setStep] = useState(0);
   const intervalRef = useRef(null);
+  const stepRef = useRef(0);
   const STEP_SECONDS = 18;
 
   function start() {
+    stepRef.current = 0;
     setStep(0);
     setRunning(true);
+    speak(MEDITATION_STEPS[0]);
   }
+
   function stop() {
+    clearInterval(intervalRef.current);
     setRunning(false);
     setStep(0);
-    clearInterval(intervalRef.current);
+    stepRef.current = 0;
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
   }
 
   useEffect(() => {
     if (running) {
       intervalRef.current = setInterval(() => {
-        setStep((s) => {
-          if (s + 1 >= MEDITATION_STEPS.length) {
-            clearInterval(intervalRef.current);
-            setRunning(false);
-            return 0;
-          }
-          return s + 1;
-        });
+        const next = stepRef.current + 1;
+        if (next >= MEDITATION_STEPS.length) {
+          clearInterval(intervalRef.current);
+          if (window.speechSynthesis) window.speechSynthesis.cancel();
+          setRunning(false);
+          setStep(0);
+          stepRef.current = 0;
+          return;
+        }
+        stepRef.current = next;
+        setStep(next);
+        speak(MEDITATION_STEPS[next]);
       }, STEP_SECONDS * 1000);
     }
     return () => clearInterval(intervalRef.current);
@@ -866,39 +980,68 @@ function GefuehrteMeditation() {
   );
 }
 
+const ATEM_PHASES = [
+  { name: "Einatmen", secs: 4, expanded: true,  transition: "4s ease-in" },
+  { name: "Halten",   secs: 7, expanded: true,  transition: "0.1s linear" },
+  { name: "Ausatmen", secs: 8, expanded: false, transition: "8s ease-in-out" },
+];
+
 function AtemUebung() {
   const [running, setRunning] = useState(false);
-  const [phase, setPhase] = useState("Bereit");
-  const [scale, setScale] = useState(0.5);
-  const timeoutRef = useRef(null);
+  const [phaseIdx, setPhaseIdx] = useState(0);
+  const [countdown, setCountdown] = useState(ATEM_PHASES[0].secs);
+  const intervalRef = useRef(null);
 
-  useEffect(() => () => clearTimeout(timeoutRef.current), []);
-
-  function cycle() {
-    setPhase("Einatmen"); setScale(1);
-    timeoutRef.current = setTimeout(() => {
-      setPhase("Halten");
-      timeoutRef.current = setTimeout(() => {
-        setPhase("Ausatmen"); setScale(0.5);
-        timeoutRef.current = setTimeout(() => { if (running) cycle(); }, 8000);
-      }, 7000);
-    }, 4000);
-  }
+  useEffect(() => {
+    if (!running) return;
+    let pi = 0, count = ATEM_PHASES[0].secs;
+    setPhaseIdx(0);
+    setCountdown(count);
+    intervalRef.current = setInterval(() => {
+      count -= 1;
+      if (count <= 0) {
+        pi = (pi + 1) % ATEM_PHASES.length;
+        count = ATEM_PHASES[pi].secs;
+        setPhaseIdx(pi);
+      }
+      setCountdown(count);
+    }, 1000);
+    return () => clearInterval(intervalRef.current);
+  }, [running]);
 
   function toggle() {
-    if (running) { setRunning(false); setPhase("Bereit"); setScale(0.5); clearTimeout(timeoutRef.current); }
-    else setRunning(true);
+    if (running) {
+      clearInterval(intervalRef.current);
+      setRunning(false);
+      setPhaseIdx(0);
+      setCountdown(ATEM_PHASES[0].secs);
+    } else {
+      setRunning(true);
+    }
   }
 
-  useEffect(() => { if (running) cycle(); /* eslint-disable-next-line */ }, [running]);
+  const phase = ATEM_PHASES[phaseIdx];
+  const size = running && phase.expanded ? 126 : 70;
 
   return (
     <Card tint={C.lavenderSoft} className="!border-0 flex flex-col items-center py-8">
       <p style={{ fontFamily: MONO, fontSize: 11, color: C.lavender }} className="mb-6">ATEMÜBUNG · 4–7–8</p>
-      <div className="relative flex items-center justify-center mb-6" style={{ width: 140, height: 140 }}>
-        <div style={{ width: 90 * scale + 40, height: 90 * scale + 40, borderRadius: "50%", backgroundColor: "white", border: `2px solid ${C.lavender}`, transition: "all 4s ease-in-out" }} />
+      <div className="flex items-center justify-center mb-4" style={{ width: 140, height: 140 }}>
+        <div style={{
+          width: size, height: size,
+          borderRadius: "50%",
+          backgroundColor: "white",
+          border: `2px solid ${C.lavender}`,
+          transition: running ? `width ${phase.transition}, height ${phase.transition}, box-shadow ${phase.transition}` : "width 0.4s ease, height 0.4s ease",
+          boxShadow: running && phase.expanded ? "0 0 28px -4px rgba(120,88,214,0.35)" : "none",
+        }} />
       </div>
-      <p style={{ fontFamily: MONO, fontSize: 13, color: C.ink }} className="mb-6">{phase}</p>
+      <p style={{ fontFamily: MONO, fontSize: 13, color: C.ink }} className="mb-1">
+        {running ? phase.name : "Bereit"}
+      </p>
+      <p style={{ fontFamily: MONO, fontSize: 32, fontWeight: 600, color: C.lavender, lineHeight: 1, minHeight: 40 }} className="mb-5">
+        {running ? countdown : ""}
+      </p>
       <button onClick={toggle} style={{ backgroundColor: running ? C.ink : C.lavender, color: "white" }} className="px-6 py-2.5 rounded-full flex items-center gap-2 text-sm">
         {running ? <><Pause size={15} /> Stoppen</> : <><Play size={15} /> Starten</>}
       </button>

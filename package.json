@@ -4,17 +4,25 @@
   "private": true,
   "description": "Innenschau – tägliche Standortbestimmung. Standalone PWA build.",
   "scripts": {
-    "build": "esbuild main.jsx --bundle --minify --format=esm --jsx=automatic --outfile=bundle.js --loader:.js=jsx",
-    "watch": "esbuild main.jsx --bundle --format=esm --jsx=automatic --outfile=bundle.js --loader:.js=jsx --watch",
-    "serve": "npx serve ."
+    "build": "esbuild main.jsx --bundle --minify --format=esm --jsx=automatic --outfile=bundle.js --loader:.js=jsx && tailwindcss -i src/input.css -o tailwind.css --minify",
+    "watch": "concurrently \"esbuild main.jsx --bundle --format=esm --jsx=automatic --outfile=bundle.js --loader:.js=jsx --watch\" \"tailwindcss -i src/input.css -o tailwind.css --watch\"",
+    "serve": "npx serve .",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "lucide-react": "0.383.0",
     "react": "^18.0.0",
     "react-dom": "^18.0.0",
-    "recharts": "^2.0.0"
+    "recharts": "^2.0.0",
+    "stripe": "^16.0.0"
   },
   "devDependencies": {
-    "esbuild": "^0.20.0"
+    "autoprefixer": "^10.4.0",
+    "concurrently": "^8.0.0",
+    "esbuild": "^0.20.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^3.4.0",
+    "vitest": "^2.0.0"
   }
 }
