@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Plus, Trash2, Play, Pause, Sparkles, Download, Loader2, Mic, ChevronLeft, ChevronRight, Search, X } from "lucide-react";
+import { Plus, Trash2, Play, Pause, Sparkles, Download, Loader2, Mic, ChevronLeft, ChevronRight, Search, X, Volume2, VolumeX } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { addDays, computeLongest, computeStrength, mergeMorning, mergeEvening, storage } from "./logic.js";
 
@@ -838,16 +838,142 @@ function PoseIcon({ d }) {
   );
 }
 
+function AmbientPlayer() {
+  const [mode, setMode] = useState(null);
+  const ctxRef = useRef(null);
+  const nodesRef = useRef([]);
+
+  function stopAll() {
+    nodesRef.current.forEach((n) => { try { n.stop?.(); } catch {} });
+    nodesRef.current = [];
+    if (ctxRef.current) { ctxRef.current.close().catch(() => {}); ctxRef.current = null; }
+  }
+
+  function startMode(m) {
+    stopAll();
+    if (!m) return;
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctxRef.current = ctx;
+    const nodes = [];
+
+    if (m === "rain" || m === "waves") {
+      const bufSize = ctx.sampleRate * 4;
+      const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      let last = 0;
+      for (let i = 0; i < bufSize; i++) {
+        const w = Math.random() * 2 - 1;
+        data[i] = (last + 0.02 * w) / 1.02;
+        last = data[i];
+        data[i] *= 3.5;
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.loop = true;
+      nodes.push(src);
+      const filter = ctx.createBiquadFilter();
+      filter.type = "lowpass";
+      filter.frequency.value = m === "waves" ? 280 : 420;
+      const gain = ctx.createGain();
+      gain.gain.value = 0.65;
+      src.connect(filter);
+      filter.connect(gain);
+      if (m === "waves") {
+        const lfo = ctx.createOscillator();
+        lfo.type = "sine";
+        lfo.frequency.value = 0.08;
+        const lfoGain = ctx.createGain();
+        lfoGain.gain.value = 0.28;
+        lfo.connect(lfoGain);
+        lfoGain.connect(gain.gain);
+        lfo.start();
+        nodes.push(lfo);
+      }
+      gain.connect(ctx.destination);
+      src.start();
+    }
+
+    if (m === "hum") {
+      [80, 160, 240].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        osc.type = "sine";
+        osc.frequency.value = freq;
+        const g = ctx.createGain();
+        g.gain.value = 0.07 / (i + 1);
+        osc.connect(g);
+        g.connect(ctx.destination);
+        osc.start();
+        nodes.push(osc);
+      });
+    }
+
+    nodesRef.current = nodes;
+  }
+
+  function select(m) {
+    const next = m === mode ? null : m;
+    setMode(next);
+    startMode(next);
+  }
+
+  useEffect(() => () => stopAll(), []);
+
+  const SOUNDS = [
+    { id: "rain", label: "Regen" },
+    { id: "waves", label: "Wellen" },
+    { id: "hum", label: "Summen" },
+  ];
+
+  return (
+    <Card tint={C.lavenderSoft} className="!border-0">
+      <p style={{ fontFamily: MONO, fontSize: 10, color: C.lavender }} className="mb-3">HINTERGRUNDKLANG</p>
+      <div className="flex items-center gap-2 flex-wrap">
+        <button onClick={() => { setMode(null); stopAll(); }}
+          style={{ fontFamily: MONO, fontSize: 11, padding: "5px 12px", borderRadius: 999, background: !mode ? C.lavender : "white", color: !mode ? "white" : C.inkSoft, border: `1px solid ${!mode ? "transparent" : C.line}` }}>
+          AUS
+        </button>
+        {SOUNDS.map(({ id, label }) => (
+          <button key={id} onClick={() => select(id)}
+            style={{ fontFamily: MONO, fontSize: 11, padding: "5px 12px", borderRadius: 999, background: mode === id ? C.lavender : "white", color: mode === id ? "white" : C.inkSoft, border: `1px solid ${mode === id ? "transparent" : C.line}` }}>
+            {label.toUpperCase()}
+          </button>
+        ))}
+        {mode && <span style={{ fontFamily: MONO, fontSize: 10, color: C.lavender, marginLeft: "auto" }}>◉ AKTIV</span>}
+      </div>
+    </Card>
+  );
+}
+
 function RuheTab() {
   const [sub, setSub] = useState("atem");
+  const [speaking, setSpeaking] = useState(false);
   const question = todaysQuestion();
+
+  function toggleQuestion() {
+    if (speaking) {
+      window.speechSynthesis?.cancel();
+      setSpeaking(false);
+    } else {
+      setSpeaking(true);
+      speak(question, { onEnd: () => setSpeaking(false) });
+    }
+  }
 
   return (
     <div className="space-y-6">
       <Card tint={C.lavenderSoft} className="!border-0">
-        <p style={{ fontFamily: MONO, fontSize: 10, color: C.lavender }} className="mb-2">FRAGE ZUM VERWEILEN</p>
+        <div className="flex items-start justify-between mb-2">
+          <p style={{ fontFamily: MONO, fontSize: 10, color: C.lavender }}>FRAGE ZUM VERWEILEN</p>
+          {window.speechSynthesis && (
+            <button onClick={toggleQuestion} style={{ color: speaking ? C.lavender : C.inkSoft, marginTop: -2, flexShrink: 0 }}>
+              {speaking ? <VolumeX size={15} /> : <Volume2 size={15} />}
+            </button>
+          )}
+        </div>
         <p style={{ fontFamily: DISPLAY, fontStyle: "italic", fontSize: 19, lineHeight: 1.4, color: C.ink }}>{question}</p>
       </Card>
+
+      <AmbientPlayer />
 
       <div className="flex rounded-full overflow-hidden w-fit" style={{ border: `1px solid ${C.line}` }}>
         {[["atem", "Atem"], ["meditation", "Meditation"], ["yoga", "Yoga"], ["musik", "Musik"]].map(([id, label]) => (
@@ -899,13 +1025,14 @@ function RuheTab() {
   );
 }
 
-function speak(text) {
+function speak(text, { onEnd } = {}) {
   if (!window.speechSynthesis) return;
   window.speechSynthesis.cancel();
   const utter = new SpeechSynthesisUtterance(text);
   utter.lang = "de-DE";
   utter.rate = 0.78;
   utter.pitch = 0.9;
+  if (onEnd) utter.onend = onEnd;
   const trySpeak = () => {
     const voices = window.speechSynthesis.getVoices();
     const deVoice = voices.find((v) => v.lang.startsWith("de"));
