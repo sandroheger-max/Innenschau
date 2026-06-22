@@ -1,4 +1,4 @@
-const CACHE = "innenschau-v20260622121447";
+const CACHE = "innenschau-v20260622141940";
 const SHELL = ["/", "/index.html", "/bundle.js", "/manifest.json", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (event) => {
